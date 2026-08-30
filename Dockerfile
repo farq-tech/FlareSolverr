@@ -43,7 +43,7 @@ RUN dpkg -i /libgl1-mesa-dri.deb \
     && mkdir /config \
     && chown flaresolverr:flaresolverr /config
 
-VOLUME /config
+# Railway rejects Dockerfile VOLUME; /config is created above and writable.
 
 # Install Python dependencies
 COPY requirements.txt .

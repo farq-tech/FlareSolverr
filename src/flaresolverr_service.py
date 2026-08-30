@@ -1,10 +1,11 @@
+import json
 import logging
 import platform
 import sys
 import time
 from datetime import timedelta
 from html import escape
-from urllib.parse import unquote, quote
+from urllib.parse import unquote, quote, urlparse
 
 from func_timeout import FunctionTimedOut, func_timeout
 from selenium.common import TimeoutException
@@ -119,8 +120,9 @@ def _controller_v1_handler(req: V1RequestBase) -> V1ResponseBase:
     # do some validations
     if req.cmd is None:
         raise Exception("Request parameter 'cmd' is mandatory.")
-    if req.headers is not None:
-        logging.warning("Request parameter 'headers' was removed in FlareSolverr v2.")
+    if req.headers is not None and not isinstance(req.headers, dict):
+        logging.warning("Request parameter 'headers' must be a dict (name→value); ignoring non-dict value.")
+        req.headers = None
     if req.userAgent is not None:
         logging.warning("Request parameter 'userAgent' was removed in FlareSolverr v2.")
 
@@ -146,6 +148,127 @@ def _controller_v1_handler(req: V1RequestBase) -> V1ResponseBase:
     return res
 
 
+
+# --- farq json-post patch (adapted from FlareSolverr PR #1542) -----------------
+# Enables request.post with application/json + custom headers via in-browser XHR,
+# after CF clearance (same Chrome / session). Form-urlencoded POST unchanged.
+
+_XHR_FORBIDDEN_HEADERS = {
+    'accept-charset', 'accept-encoding', 'access-control-request-headers',
+    'access-control-request-method', 'connection', 'content-length', 'cookie',
+    'cookie2', 'date', 'dnt', 'expect', 'host', 'keep-alive', 'origin',
+    'referer', 'te', 'trailer', 'transfer-encoding', 'upgrade', 'via',
+}
+
+
+def _request_headers_dict(req: V1RequestBase) -> dict:
+    headers = getattr(req, 'headers', None) or {}
+    if not isinstance(headers, dict):
+        return {}
+    return {str(k): str(v) for k, v in headers.items() if k is not None and v is not None}
+
+
+def _request_content_type(req: V1RequestBase) -> str:
+    headers = _request_headers_dict(req)
+    for name, value in headers.items():
+        if name.lower() == 'content-type':
+            return value.lower()
+    ct = getattr(req, 'contentType', None)
+    if ct:
+        return str(ct).lower()
+    return 'application/x-www-form-urlencoded'
+
+
+def _is_json_post(req: V1RequestBase) -> bool:
+    return 'application/json' in _request_content_type(req)
+
+
+def _ensure_same_origin(req: V1RequestBase, driver: WebDriver) -> None:
+    """Navigate to site origin so CF cookies attach before an XHR API call."""
+    target = urlparse(req.url)
+    if not target.scheme or not target.netloc:
+        raise Exception(f"Invalid url for JSON POST: {req.url}")
+    current = urlparse(driver.current_url or '')
+    if current.scheme == target.scheme and current.netloc == target.netloc:
+        return
+    origin = f"{target.scheme}://{target.netloc}/"
+    logging.debug(f"JSON POST: navigating to origin {origin} before XHR")
+    driver.get(origin)
+
+
+def _execute_xhr_request(driver: WebDriver, method: str, url: str,
+                         headers: dict = None, body: str = None) -> dict:
+    """Run XMLHttpRequest inside the cleared Chrome page; return status/body."""
+    headers = headers or {}
+    safe_headers = {}
+    for name, value in headers.items():
+        if name.lower() in _XHR_FORBIDDEN_HEADERS:
+            logging.debug(f"Skipping forbidden XHR header: {name}")
+            continue
+        if name.lower() == 'user-agent':
+            # Browsers ignore UA overrides on XHR; Chrome UA must match CF clearance.
+            logging.debug("Skipping User-Agent header (not settable via XHR)")
+            continue
+        safe_headers[name] = value
+
+    # json.dumps produces JS-safe quoted strings
+    headers_js = '\n'.join(
+        f"xhr.setRequestHeader({json.dumps(n)}, {json.dumps(v)});"
+        for n, v in safe_headers.items()
+    )
+    body_js = 'null' if body is None else json.dumps(body)
+    script = f"""
+        const callback = arguments[arguments.length - 1];
+        try {{
+            var xhr = new XMLHttpRequest();
+            xhr.open({json.dumps(method.upper())}, {json.dumps(url)}, true);
+            xhr.withCredentials = true;
+            {headers_js}
+            xhr.onload = function() {{
+                callback({{
+                    status: xhr.status,
+                    statusText: xhr.statusText,
+                    responseText: xhr.responseText,
+                    responseURL: xhr.responseURL
+                }});
+            }};
+            xhr.onerror = function() {{
+                callback({{
+                    status: xhr.status || 0,
+                    statusText: 'error',
+                    responseText: xhr.responseText || '',
+                    responseURL: xhr.responseURL || {json.dumps(url)},
+                    error: 'network_error'
+                }});
+            }};
+            xhr.send({body_js});
+        }} catch (e) {{
+            callback({{
+                status: 0,
+                statusText: 'exception',
+                responseText: String(e),
+                error: 'exception'
+            }});
+        }}
+    """
+    driver.set_script_timeout(120)
+    result = driver.execute_async_script(script)
+    if not isinstance(result, dict):
+        return {'status': 0, 'responseText': str(result), 'error': 'bad_xhr_result'}
+    return result
+
+
+def _json_post_body(req: V1RequestBase) -> str:
+    if req.postData is None:
+        raise Exception("postData is empty for JSON POST request")
+    if isinstance(req.postData, (dict, list)):
+        return json.dumps(req.postData)
+    raw = str(req.postData)
+    # Validate JSON so we fail early with a clear message
+    json.loads(raw)
+    return raw
+
+
 def _cmd_request_get(req: V1RequestBase) -> V1ResponseBase:
     # do some validations
     if req.url is None:
@@ -169,6 +292,7 @@ def _cmd_request_post(req: V1RequestBase) -> V1ResponseBase:
     # do some validations
     if req.postData is None:
         raise Exception("Request parameter 'postData' is mandatory in 'request.post' command.")
+    # JSON body: pass headers={"Content-Type":"application/json", ...} and postData as JSON string.
     if req.returnRawHtml is not None:
         logging.warning("Request parameter 'returnRawHtml' was removed in FlareSolverr v2.")
     if req.download is not None:
@@ -372,9 +496,14 @@ def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> Challenge
     # navigate to the page
     logging.debug(f"Navigating to... {req.url}")
     turnstile_token = None
+    json_post = method == "POST" and _is_json_post(req)
 
     if method == "POST":
-        _post_request(req, driver)
+        if json_post:
+            # Clear CF on origin first; fire XHR after challenge loop below.
+            _ensure_same_origin(req, driver)
+        else:
+            _post_request(req, driver)
     else:
         if req.tabs_till_verify is None:
             driver.get(req.url)
@@ -389,7 +518,10 @@ def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> Challenge
             driver.add_cookie(cookie)
         # reload the page
         if method == 'POST':
-            _post_request(req, driver)
+            if json_post:
+                _ensure_same_origin(req, driver)
+            else:
+                _post_request(req, driver)
         else:
             driver.get(req.url)
 
@@ -475,13 +607,25 @@ def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> Challenge
     challenge_res.userAgent = utils.get_user_agent(driver)
     challenge_res.turnstile_token = turnstile_token
 
-    if not req.returnOnlyCookies:
+    if req.waitInSeconds and req.waitInSeconds > 0:
+        logging.info("Waiting " + str(req.waitInSeconds) + " seconds before returning the response...")
+        time.sleep(req.waitInSeconds)
+
+    xhr_result = None
+    if json_post:
+        headers = _request_headers_dict(req)
+        if not any(k.lower() == 'content-type' for k in headers):
+            headers['Content-Type'] = getattr(req, 'contentType', None) or 'application/json'
+        body = _json_post_body(req)
+        logging.info("Executing in-browser JSON XHR POST after challenge resolution")
+        xhr_result = _execute_xhr_request(driver, 'POST', req.url, headers, body)
+        challenge_res.status = int(xhr_result.get('status') or 0)
+        challenge_res.url = xhr_result.get('responseURL') or req.url
+        if not req.returnOnlyCookies:
+            challenge_res.headers = {}
+            challenge_res.response = xhr_result.get('responseText') or ''
+    elif not req.returnOnlyCookies:
         challenge_res.headers = {}  # todo: fix, selenium not provides this info
-
-        if req.waitInSeconds and req.waitInSeconds > 0:
-            logging.info("Waiting " + str(req.waitInSeconds) + " seconds before returning the response...")
-            time.sleep(req.waitInSeconds)
-
         challenge_res.response = driver.page_source
 
     if req.returnScreenshot:
