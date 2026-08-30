@@ -15,35 +15,17 @@ Based on upstream FlareSolverr `master` + ideas from [PR #1542](https://github.c
 - Form-urlencoded `request.post` unchanged (HTML form hack)
 - Turnstile / disableMedia / sessions preserved
 
-## Deployed
+## Durable deploy source
 
-- Railway project **Farq** / service **flaresolverr**
+- GitHub: https://github.com/farq-tech/FlareSolverr (fork of FlareSolverr/FlareSolverr)
+- Branch: `farq-json-post`
 - Version string: `3.5.0+farq-json-post`
-- Deploy method: `railway up` from patched tree (Dockerfile `VOLUME` removed — Railway rejects it)
+- Railway project **Farq** (`b260dd2a-6eb9-416c-a717-80a652cdb199`) / service **flaresolverr**
+- Build: Dockerfile from GitHub branch (not ephemeral `railway up`)
 - Private URL: `http://flaresolverr.railway.internal:8191`
 
-### Rebuild from this folder
+Dockerfile has no `VOLUME` line (Railway rejects it); `/config` is created in-image and writable.
 
-```bash
-# Apply patches onto a fresh FlareSolverr clone, or use the .py copies here as the
-# src/ replacements, then:
-cd /path/to/patched-flaresolverr
-# ensure Dockerfile has no VOLUME line
-railway link -p Farq -e production -s flaresolverr
-railway up -s flaresolverr -e production --ci
-```
+## Provenance
 
-## HUMAN ACTION (durable image source)
-
-Railway currently serves the CLI-uploaded build. For a durable GitHub-sourced image:
-
-1. On GitHub: **Fork** `https://github.com/FlareSolverr/FlareSolverr` → `farq-tech/FlareSolverr` (or similar).
-2. Push branch `farq-json-post` with this patch (`dtos.py`, `flaresolverr_service.py`, Dockerfile without `VOLUME`, version bump in `package.json`).
-3. In Railway UI → service `flaresolverr` → Settings → connect that repo/branch (replace `ghcr.io/flaresolverr/flaresolverr:latest`).
-4. Delete accidental empty Railway project created during deploy experiments named **patched** (id `6ccaec80-7475-47a6-b781-328d54e365a6`) if still present.
-
-## Oregon probe (2026-08-30)
-
-Session GET `https://hungerstation.com/` → `cf_clearance` present.  
-Same-session JSON POST `/api/v3/verification/refresh` → **HTTP 401** `unauthorized` (API reached — **not CF**).  
-Verdict: `AUTH_REJECTED_NOT_CF` (credential/header contract; do not rotate tokens until directed).
+Patch copies / patches also live in the Farq monorepo under `ops/flaresolverr-json-post/` for audit.
